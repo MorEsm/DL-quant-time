@@ -12,6 +12,11 @@ models (:mod:`dlquanttime.models.densenet1d`):
 import torch
 import torch.nn as nn
 
+#: The decoder uses 3 stride-2 ConvTranspose1d layers (2 ** 3 == 8), so the
+#: pre-decoder feature map must be upsampled by this factor to reach
+#: ``target_length`` before the final interpolation adjustment.
+_DECODER_UPSAMPLE_FACTOR = 8
+
 
 class ConvAutoencoder(nn.Module):
     """Convolutional-autoencoder-style metabolite quantification baseline.
@@ -59,7 +64,7 @@ class ConvAutoencoder(nn.Module):
 
     def decode(self, latent: torch.Tensor, target_length: int) -> torch.Tensor:
         x = self.decoder_fc(latent).unsqueeze(-1)
-        x = x.expand(-1, -1, max(target_length // 8, 1))
+        x = x.expand(-1, -1, max(target_length // _DECODER_UPSAMPLE_FACTOR, 1))
         recon = self.decoder(x)
         if recon.shape[-1] != target_length:
             recon = nn.functional.interpolate(recon, size=target_length)

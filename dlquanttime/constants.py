@@ -12,6 +12,11 @@ from collections import OrderedDict
 #: package, together with an approximate dominant chemical shift (ppm) and
 #: typical linewidth-independent relative visibility used purely for
 #: generating plausible synthetic amplitude ranges.
+#: Note: Cr and PCr intentionally share the same dominant chemical shift
+#: (3.03 ppm), reflecting the well-known spectral overlap between
+#: creatine and phosphocreatine in ¹H MRS; in this simplified simulator
+#: they are distinguished only by their (independently sampled)
+#: amplitude and linewidth.
 METABOLITES = OrderedDict(
     [
         ("NAA", 2.02),

@@ -124,7 +124,40 @@ class _DenseNetEncoder1D(nn.Module):
         return x
 
 
-class DCDenseNet(nn.Module):
+class _DualInputDenseNetBase(nn.Module):
+    """Shared dual-input (real/imaginary FID) encoder + regression head.
+
+    Builds the common DenseNet1D encoder and a small regression head
+    mapping pooled encoder features to ``n_metabolites`` amplitude
+    predictions. Used as the shared base for both :class:`DCDenseNet` and
+    :class:`MCDenseNetGGG`.
+    """
+
+    def __init__(
+        self,
+        n_metabolites: int,
+        n_points: int = 2048,
+        growth_rate: int = 8,
+        block_layers: Sequence[int] = (4, 4, 4),
+    ):
+        super().__init__()
+        self.n_points = n_points
+        self.n_metabolites = n_metabolites
+        self.encoder = _DenseNetEncoder1D(
+            in_channels=2, growth_rate=growth_rate, block_layers=block_layers
+        )
+        self.head = nn.Sequential(
+            nn.Linear(self.encoder.out_features, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, n_metabolites),
+        )
+
+    def _encode_and_predict(self, fid: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(fid)
+        return self.head(features)
+
+
+class DCDenseNet(_DualInputDenseNetBase):
     """Dual-input (real + imaginary channel) DenseNet metabolite quantifier.
 
     Parameters
@@ -138,24 +171,6 @@ class DCDenseNet(nn.Module):
         DenseNet hyper-parameters, see :class:`_DenseNetEncoder1D`.
     """
 
-    def __init__(
-        self,
-        n_metabolites: int,
-        n_points: int = 2048,
-        growth_rate: int = 8,
-        block_layers: Sequence[int] = (4, 4, 4),
-    ):
-        super().__init__()
-        self.n_points = n_points
-        self.encoder = _DenseNetEncoder1D(
-            in_channels=2, growth_rate=growth_rate, block_layers=block_layers
-        )
-        self.head = nn.Sequential(
-            nn.Linear(self.encoder.out_features, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, n_metabolites),
-        )
-
     def forward(self, fid: torch.Tensor) -> torch.Tensor:
         """Predict metabolite amplitudes from a complex time-domain FID.
 
@@ -166,11 +181,10 @@ class DCDenseNet(nn.Module):
             stacked real (channel 0) and imaginary (channel 1) parts of
             the FID.
         """
-        features = self.encoder(fid)
-        return self.head(features)
+        return self._encode_and_predict(fid)
 
 
-class MCDenseNetGGG(nn.Module):
+class MCDenseNetGGG(_DualInputDenseNetBase):
     """Multi-input DenseNet with an AR-conditioned, GGG-constrained pathway.
 
     In addition to the dual-input time-domain encoder used by
@@ -194,25 +208,19 @@ class MCDenseNetGGG(nn.Module):
         block_layers: Sequence[int] = (4, 4, 4),
         ar_hidden_dim: int = 16,
     ):
-        super().__init__()
         if len(set(ggg_indices)) != len(ggg_indices):
             raise ValueError("ggg_indices must not contain duplicates")
         if any(idx < 0 or idx >= n_metabolites for idx in ggg_indices):
             raise ValueError("ggg_indices must be valid metabolite indices")
 
-        self.n_points = n_points
-        self.n_metabolites = n_metabolites
+        super().__init__(
+            n_metabolites,
+            n_points=n_points,
+            growth_rate=growth_rate,
+            block_layers=block_layers,
+        )
         self.register_buffer(
             "ggg_indices", torch.as_tensor(list(ggg_indices), dtype=torch.long)
-        )
-
-        self.encoder = _DenseNetEncoder1D(
-            in_channels=2, growth_rate=growth_rate, block_layers=block_layers
-        )
-        self.head = nn.Sequential(
-            nn.Linear(self.encoder.out_features, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, n_metabolites),
         )
 
         # AR pathway: constrained to only ever produce len(ggg_indices)
@@ -234,8 +242,7 @@ class MCDenseNetGGG(nn.Module):
             Real tensor of shape ``(batch, n_ar_features)`` of AR
             coefficients extracted from the GGG-band-limited FID.
         """
-        features = self.encoder(fid)
-        out = self.head(features)
+        out = self._encode_and_predict(fid)
 
         ar_contribution = self.ar_pathway(ar_features)
         ggg_update = torch.zeros_like(out)
