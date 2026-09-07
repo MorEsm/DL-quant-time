@@ -1,1 +1,512 @@
+""" Deep Learning for Direct Time-Domain Quantification of Brain Metabolites in ¹H MR Spectroscopy
+    (2026)
+    DenseNet and related 1-D CNN architectures for MRS spectral fitting."""
 
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras import layers as L
+from tensorflow.keras.layers import (
+    Input, Dense, Reshape, Conv1D, BatchNormalization,
+    MaxPooling1D, AveragePooling1D, GlobalAveragePooling1D, ReLU,
+    Concatenate, Conv1DTranspose, Flatten, UpSampling1D,
+    LayerNormalization, Lambda, Dropout,
+)
+from tensorflow.keras.models import Model
+
+
+def make_weighted_mse(rel_amp: dict, output_keys: list):
+    """
+    Build and register a per-channel weighted MSE loss.
+
+    Weights are inversely proportional to nominal metabolite amplitude so
+    minor metabolites contribute equally to the gradient as major ones.
+    The final 2 channels (combined spectrum real+imag) are weighted at 1.0.
+    All weights normalised so mean = 1.0 (preserves loss scale).
+
+    Parameters
+    ==========
+    rel_amp     : dict  {metabolite_name: nominal_relative_amplitude}
+    output_keys : list  ordered metabolite names matching Y channel layout
+
+    Returns
+    =======
+    weighted_mse : callable — registered Keras loss function
+    CHANNEL_WEIGHTS : tf.Tensor — (N_Y_CHANNELS,) weight vector (for logging)
+    """
+    amp_vals      = np.array([rel_amp[k] for k in output_keys], dtype=np.float32)
+    met_weights   = amp_vals.max() / amp_vals          # inverse amplitude
+    chan_weights  = np.repeat(met_weights, 2)           # real + imag per met
+    chan_weights  = np.append(chan_weights, [1.0, 1.0]) # + combined real+imag
+    chan_weights /= chan_weights.mean()                 # normalise mean = 1
+    channel_weights_tensor = tf.constant(chan_weights, dtype=tf.float32)
+
+    @tf.keras.utils.register_keras_serializable(package="mrs")
+    def weighted_mse(y_true, y_pred):
+        """Per-channel weighted MSE (inverse-amplitude weights)."""
+        sq = tf.square(y_true - y_pred)
+        sq = sq * channel_weights_tensor
+        return tf.reduce_mean(sq)
+
+    return weighted_mse, channel_weights_tensor
+
+
+#===== shared initialisers ========================================================
+HE     = tf.keras.initializers.HeNormal()
+GLOROT = tf.keras.initializers.GlorotUniform()
+ZEROS  = tf.keras.initializers.Zeros()
+
+
+#===== Resample1D: bilinear upsampling to an arbitrary target length ==============
+
+class Resample1D(tf.keras.layers.Layer):
+    """Bilinear resample a (batch, time, channels) tensor to target_length."""
+    def __init__(self, target_length, **kwargs):
+        super().__init__(**kwargs)
+        self.target_length = target_length
+
+    def call(self, x):
+        x = tf.expand_dims(x, 2)
+        x = tf.image.resize(x, (self.target_length, 1), method="bilinear")
+        return tf.squeeze(x, 2)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.target_length, input_shape[2])
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg["target_length"] = self.target_length
+        return cfg
+    
+#===== shared building blocks ====================================================
+def _bn_rl_conv(x, filters, k=1, s=1):
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    return Conv1D(filters, k, strides=s, padding='same')(x)
+
+
+def _dense_block(x, r, f):
+    for _ in range(r):
+        y = _bn_rl_conv(x, 4 * f)
+        y = _bn_rl_conv(y, f, 3)
+        x = Concatenate(axis=-1)([y, x])
+    return x
+
+
+def _transition_layer(x, f):
+    x = _bn_rl_conv(x, x.shape[-1] // 2)
+    return AveragePooling1D(2, strides=2, padding='same')(x)
+
+#===== GGGChannelMask Layer =====================================================
+class GGGChannelMask(tf.keras.layers.Layer):
+    """
+    Fixed, non-trainable per-channel mask -- multiplies its input by a
+    constant 0/1 vector.
+    """
+    def __init__(self, mask, **kwargs):
+        super().__init__(**kwargs)
+        # Store as a plain python list of floats -- JSON-safe, no numpy/tensor
+        self.mask_list = [float(v) for v in mask]
+
+    def build(self, input_shape):
+        self.mask_tensor = tf.constant(self.mask_list, dtype=tf.float32)
+        super().build(input_shape)
+
+    def call(self, x):
+        return x * self.mask_tensor
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg["mask"] = self.mask_list
+        return cfg
+
+# ===============================================================================
+#     Auto-encoder (plain Conv1D, no DenseNet blocks) — for baseline comparison
+# ===============================================================================
+def conv_autoencoder(input_shape, output_shape, dropout_rate=0.25,
+                     latent_channels=64,
+                     enc_filters=(32, 64, 96, 128, 128),
+                     dec_filters=(128, 128, 96, 64, 32),
+                     use_skip_connections=True):
+    """
+    Pure 1-D convolutional autoencoder for MRS spectral decomposition.
+
+    No DenseNet blocks — plain Conv1D encoder and decoder for use as a
+    lightweight baseline comparison against the DenseNet variants. Skip
+    connections are optional (off by default) so the model can be run
+    both as a pure bottlenecked autoencoder and as a plain-conv U-Net,
+    isolating whether skip connections alone — independent of DenseNet's
+    dense connectivity — are what a well-generalising model needs.
+
+    Parameters
+    ===========
+    input_shape     : (N_PTS, 2)             — combined FID [real, imag]
+    output_shape    : (N_PTS, N_Y_CHANNELS)  — 2·N_METS + 2 channels
+    dropout_rate    : applied at bottleneck only (0 = disabled)
+    latent_channels : bottleneck channel width (default 64)
+    enc_filters     : tuple of 5 filter counts for the encoder stages
+                       (default (32, 64, 96, 128, 128))
+    dec_filters     : tuple of 5 filter counts for the decoder stages
+                       (default (128, 128, 96, 64, 32); mirror enc_filters
+                       for a symmetric autoencoder, or widen both alongside
+                       latent_channels to capacity-match another model)
+    use_skip_connections : if True, adds 4 U-Net-style skip connections
+                       between matching-resolution encoder/decoder stages
+                       (default False, preserving the original bottleneck-only
+                       behaviour)
+    """
+    REG = tf.keras.regularizers.l2(1e-4)
+
+    #===== Encoder ==================================================================
+    inp = Input(shape=input_shape, name="fid_input")
+    x     = inp
+    skips = []
+
+    for i, filters in enumerate(enc_filters):
+        x = Conv1D(filters, kernel_size=7, strides=2,
+                   padding='same')(x)               # halves spatial dimension
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        if use_skip_connections and i < len(enc_filters) - 1:
+            skips.append(x)                          
+
+    #===== Bottleneck =================================================================
+    x = Conv1D(latent_channels, kernel_size=1,
+               activation='relu',
+               kernel_regularizer=REG,
+               name="bottleneck")(x)                
+    if dropout_rate > 0:
+        x = Dropout(dropout_rate,
+                    name="bottleneck_dropout")(x)
+
+    #===== Decoder ==================================================================
+    for j, filters in enumerate(dec_filters):
+        x = UpSampling1D(2)(x)                     
+        x = Conv1D(filters, kernel_size=7,
+                   padding='same')(x)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        if use_skip_connections and j < len(skips):
+            skip      = skips[-(j + 1)]
+            skip_proj = Conv1D(x.shape[-1], kernel_size=1,
+                               padding='same')(skip)
+            x = Concatenate(axis=-1)([x, skip_proj])
+            x = Conv1D(filters, kernel_size=3, padding='same')(x)
+            x = BatchNormalization()(x)
+            x = ReLU()(x)
+
+    x      = Conv1D(output_shape[1], kernel_size=1,
+                    activation='linear',
+                    name="output_projection")(x)
+    x      = Lambda(lambda t: t[:, :output_shape[0], :],
+                    output_shape=output_shape)(x)
+    output = Reshape(output_shape)(x)
+
+    return Model(inputs=[inp], outputs=[output], name="conv_autoencoder")
+
+# ===============================================================================
+#     Pure sequential 1-D CNN for MRS spectral decomposition
+# ===============================================================================
+def sequential_cnn(input_shape, output_shape, dropout_rate=0.3,
+                   filters=(64, 64, 192, 192, 656, 656, 656, 656, 328, 328)):
+    """
+    Pure sequential 1-D CNN for MRS spectral decomposition.
+
+    No encoder/decoder, no skip connections, no bottleneck — a straight
+    stack of Conv1D layers that maps the input FID directly to the output
+    spectral channels at the same spatial resolution throughout.
+
+    Used as the simplest possible baseline: if this matches or beats the
+    autoencoder / DenseNet variants, it suggests the task does not require
+    a compressed latent representation and is solvable by local feature
+    detection alone.
+
+    Parameters
+    ===========
+    input_shape  : (N_PTS, 2)             — combined FID [real, imag]
+    output_shape : (N_PTS, N_Y_CHANNELS)  — 2·N_METS + 2 channels
+    dropout_rate : applied once at the end of stage 5 (0 = disabled)
+    filters      : tuple of 10 filter counts, one per Conv1D layer, paired
+                   with the fixed kernel schedule [31,31,15,15,7,7,5,5,3,3]
+                   (default widened to reach ~10M params; pass the original
+                   (32,32,64,64,256,256,256,256,128,128) for the ~1.5M
+                   lightweight variant)
+    """
+    REG = tf.keras.regularizers.l2(1e-4)
+    kernel_sizes = [31, 31, 15, 15, 7, 7, 5, 5, 3, 3]
+
+    inp = Input(shape=input_shape, name="fid_input")
+    x = inp
+
+    for i, (f, k) in enumerate(zip(filters, kernel_sizes)):
+        x = Conv1D(f, kernel_size=k, padding='same',
+                   kernel_regularizer=REG if i < 2 else None)(x)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        if i == 8 and dropout_rate > 0:   
+            x = Dropout(dropout_rate, name="dropout")(x)
+
+    #===== Output projection =================================================================
+    x      = Conv1D(output_shape[1], kernel_size=1,
+                    activation='linear',
+                    name="output_projection")(x)
+    x      = Lambda(lambda t: t[:, :output_shape[0], :],
+                    output_shape=output_shape)(x)
+    output = Reshape(output_shape)(x)
+
+    return Model(inputs=[inp], outputs=[output], name="sequential_cnn")
+
+
+# ===============================================================================
+#     densenet GAP
+# ===============================================================================
+def densenet_gap(input_shape, output_shape, f=32, dropout_rate=0.30):
+    """
+    FID-only DenseNet with 128-pt bottleneck and dual-branch bridge.
+
+    Encoder stops at 128 pts (not 32 pts) so NAA/Cr separation is ~8 pts
+    instead of ~2 pts — improves amplitude discrimination.
+    """
+    REG = tf.keras.initializers.L2(1e-4)
+
+    #===== Encoder =====================================================================
+    inp = Input(shape=input_shape, name="fid_input")
+    x   = Conv1D(64, 7, strides=2, padding='same')(inp)   # 2048 → 1024
+    x   = MaxPooling1D(3, strides=2, padding='same')(x)   # 1024 →  512
+
+    for r in [4, 12]:
+        d = _dense_block(x, r, f)
+        x = _transition_layer(d, f)
+
+    d = _dense_block(x, 12, f)
+    d = _dense_block(d,  8, f)
+    x = d
+
+    #====== Bridge: dual-branch fusion =========================================================
+    gap        = GlobalAveragePooling1D()(d)
+    gmp        = tf.keras.layers.GlobalMaxPooling1D()(d)
+    global_vec = Concatenate()([gap, gmp])
+
+    bottleneck_pts = d.shape[1]                           
+    global_proj    = Dense(bottleneck_pts * 32,
+                           activation='relu',
+                           kernel_regularizer=REG)(global_vec)
+    global_proj    = Reshape((bottleneck_pts, 32))(global_proj)
+    global_proj    = LayerNormalization()(global_proj)   
+
+    spatial_branch = _bn_rl_conv(d, 32, k=3)             
+
+    x = Concatenate(axis=-1)([spatial_branch, global_proj])  
+    x = _bn_rl_conv(x, 128, k=3)                             
+
+    if dropout_rate > 0:
+        x = Dropout(dropout_rate)(x)
+
+    decoder_stages = [
+        (192, 7),   
+        (128, 5),   
+        (64,  3),   
+        (32,  3),   
+    ]
+    for filters, k in decoder_stages:
+        x = UpSampling1D(2)(x)
+        x = Conv1D(filters, kernel_size=k, padding='same',
+                   activation='relu')(x)
+        x = BatchNormalization()(x)
+
+    x      = Conv1D(output_shape[1], kernel_size=1,
+                    activation='linear',
+                    name="output_projection")(x)
+    x      = Lambda(lambda t: t[:, :output_shape[0], :],
+                    output_shape=output_shape)(x)
+    output = Reshape(output_shape)(x)
+
+    return Model(inputs=[inp], outputs=[output], name="densenet_gap")
+
+# ===============================================================================
+# ===== multi_channel_densenet (GAP variant — retained for comparison) ==========
+# ===============================================================================
+def multi_channel_densenet(fid_in, coeff_in, output_shape,
+                            f=26, dropout_rate=0.30,
+                            bridge_channels=32, coeff_dense=128):
+    """
+    DenseNet with GAP+GMP global pooling head and late injection of
+    IIR coefficients at the bottleneck.
+
+    Parameters
+    ==========
+    fid_in          : (N_PTS, 2)            — combined FID [real, imag]
+    coeff_in        : (COEFF_LEN, 4)        — AR coefficients [a_r, a_i, b_r, b_i]
+    output_shape    : (N_PTS, N_Y_CHANNELS)
+    f               : base filter count for dense blocks (default 26;
+                       was 24 — bumped slightly to land close to
+                       densenet_gap's parameter count after narrowing
+                       the bridge)
+    dropout_rate    : applied at bridge only
+    bridge_channels : channel width the pooled global vector is projected
+                       to at each of the 128 bottleneck positions before
+                       the convolutional decoder (default 32, matching
+                       densenet_gap's own global-branch width; keep this
+                       narrow — widening it is what caused the original
+                       parameter blowup)
+    coeff_dense     : unused (kept for API compatibility — FiLM conditioning
+                       replaced additive concatenation; IIR now generates
+                       γ/β modifiers for the FID GAP+GMP vector instead of
+                       adding its own features to the bottleneck)
+    """
+    REG = tf.keras.regularizers.l2(1e-4)
+
+    fid_input   = Input(shape=fid_in,   name="fid_input")
+    coeff_input = Input(shape=coeff_in, name="coeff_input")
+
+    x = Conv1D(64, 7, strides=2, padding='same')(fid_input)  
+    x = MaxPooling1D(3, strides=2, padding='same')(x)        
+
+    for r in [4, 12]:
+        d = _dense_block(x, r, f)
+        x = _transition_layer(d, f)
+
+    d = _dense_block(x, 12, f)
+    d = _dense_block(d,  8, f)
+
+    gap = GlobalAveragePooling1D()(d)
+    gmp = tf.keras.layers.GlobalMaxPooling1D()(d)
+    fid_vec = Concatenate(name="gap_gmp")([gap, gmp])
+
+    fid_vec_dim = fid_vec.shape[-1]            # 2 × last_dense_channels
+    coeff_flat  = Flatten(name="coeff_flatten")(coeff_input)
+    coeff_enc   = Dense(fid_vec_dim * 2, activation='relu',
+                        kernel_regularizer=REG,
+                        name="coeff_encode")(coeff_flat)
+    gamma       = Dense(fid_vec_dim, activation='linear',
+                        name="coeff_gamma")(coeff_enc)
+    beta        = Dense(fid_vec_dim, activation='linear',
+                        name="coeff_beta")(coeff_enc)
+    x           = (1.0 + gamma) * fid_vec + beta   # FiLM on global amplitude vec
+
+    bottleneck_pts = d.shape[1]   
+    x = Dense(bottleneck_pts * bridge_channels,
+              activation='relu',
+              kernel_regularizer=REG,
+              name="bridge_dense")(x)
+    if dropout_rate > 0:
+        x = Dropout(dropout_rate, name="bridge_dropout")(x)
+    x = Reshape((bottleneck_pts, bridge_channels), name="bridge_reshape")(x)
+
+    decoder_stages = [
+        (192, 7),
+        (128, 5),
+        (64,  3),
+        (32,  3),
+    ]
+    for filters, k in decoder_stages:
+        x = UpSampling1D(2)(x)
+        x = Conv1D(filters, kernel_size=k, padding='same',
+                   activation='relu')(x)
+        x = BatchNormalization()(x)
+
+    #===== Output projection =================================================================
+    x      = Conv1D(output_shape[1], kernel_size=1,
+                    activation='linear',
+                    name="output_projection")(x)
+    x      = Lambda(lambda t: t[:, :output_shape[0], :],
+                    output_shape=output_shape)(x)
+    output = Reshape(output_shape)(x)
+
+    return Model(inputs=[fid_input, coeff_input], outputs=[output],
+                 name="multi_channel_densenet")
+
+# ===============================================================================
+#    multi_channel_densenet_GGG (v3) — same as v2, but the mask multiply is
+#    a proper Layer subclass instead of a Lambda-with-closure 
+# ===============================================================================
+def multi_channel_densenet_GGG(fid_in, ggg_coeff_in, output_shape, output_keys,
+                                f=32, dropout_rate=0.30,
+                                correction_hidden=128):
+    import numpy as np
+    REG = tf.keras.regularizers.l2(1e-4)
+    ZERO_INIT = tf.keras.initializers.Zeros()
+
+    fid_input   = Input(shape=fid_in,       name="fid_input")
+    ggg_input   = Input(shape=ggg_coeff_in, name="ggg_coeff_input")
+
+    x = Conv1D(64, 7, strides=2, padding='same')(fid_input)
+    x = MaxPooling1D(3, strides=2, padding='same')(x)
+
+    for r in [4, 12]:
+        d = _dense_block(x, r, f)
+        x = _transition_layer(d, f)
+
+    d = _dense_block(x, 12, f)
+    d = _dense_block(d,  8, f)
+    x = d
+
+    gap        = GlobalAveragePooling1D()(d)
+    gmp        = tf.keras.layers.GlobalMaxPooling1D()(d)
+    global_vec = Concatenate()([gap, gmp])
+
+    bottleneck_pts = d.shape[1]
+    global_proj    = Dense(bottleneck_pts * 32,
+                           activation='relu',
+                           kernel_regularizer=REG)(global_vec)
+    global_proj    = Reshape((bottleneck_pts, 32))(global_proj)
+    global_proj    = LayerNormalization()(global_proj)
+
+    spatial_branch = _bn_rl_conv(d, 32, k=3)
+
+    x = Concatenate(axis=-1)([spatial_branch, global_proj])
+    x = _bn_rl_conv(x, 128, k=3)
+
+    if dropout_rate > 0:
+        x = Dropout(dropout_rate)(x)
+
+    decoder_stages = [(192, 7), (128, 5), (64, 3), (32, 3)]
+    for filters, k in decoder_stages:
+        x = UpSampling1D(2)(x)
+        x = Conv1D(filters, kernel_size=k, padding='same',
+                   activation='relu')(x)
+        x = BatchNormalization()(x)
+
+    output_base = Conv1D(output_shape[1], kernel_size=1,
+                        activation='linear',
+                        name="output_projection")(x)
+    output_base = Lambda(lambda t: t[:, :output_shape[0], :])(output_base)
+
+    ggg_flat = Flatten(name="ggg_flatten")(ggg_input)
+    c = Dense(correction_hidden, activation='relu',
+             kernel_regularizer=REG, name="ggg_encode")(ggg_flat)
+    c = LayerNormalization(name="ggg_encode_ln")(c)
+
+    mini_start_pts = 128
+    c = Dense(mini_start_pts * 16, activation='relu',
+             kernel_regularizer=REG, name="ggg_bridge_dense")(c)
+    c = Reshape((mini_start_pts, 16), name="ggg_bridge_reshape")(c)
+
+    mini_decoder_stages = [(32, 5), (24, 5), (16, 3), (16, 3)]
+    for filters, k in mini_decoder_stages:
+        c = UpSampling1D(2)(c)
+        c = Conv1D(filters, kernel_size=k, padding='same',
+                   activation='relu')(c)
+        c = BatchNormalization()(c)
+
+    correction = Conv1D(output_shape[1], kernel_size=1,
+                        activation=None,
+                        kernel_initializer=ZERO_INIT,
+                        bias_initializer=ZERO_INIT,
+                        name="ggg_correction_zero_init")(c)
+
+    n_y_channels = output_shape[1]
+    mask_np = np.zeros(n_y_channels, dtype=np.float32)
+    for name in ("Glu", "Gln", "GABA"):
+        idx = output_keys.index(name)
+        mask_np[2 * idx]     = 1.0
+        mask_np[2 * idx + 1] = 1.0
+
+    masked_correction = GGGChannelMask(
+        mask_np.tolist(), name="ggg_channel_mask")(correction)
+
+    final_output = tf.keras.layers.Add(name="add_ggg_correction")(
+        [output_base, masked_correction])
+    output = Reshape(output_shape)(final_output)
+
+    return Model(inputs=[fid_input, ggg_input], outputs=[output],
+                 name="multi_channel_densenet_GGG")
