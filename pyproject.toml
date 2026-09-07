@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlquanttime"
+version = "0.1.0"
+description = "Deep learning framework for direct time-domain quantification of brain metabolites in 1H MR spectroscopy"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "CC0-1.0" }
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=1.10"]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["dlquanttime*"]

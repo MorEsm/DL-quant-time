@@ -1,0 +1,3 @@
+# Installs this package together with the torch and test extras. Pinned
+# version ranges are declared once, in pyproject.toml, to avoid drift.
+-e .[torch,test]
