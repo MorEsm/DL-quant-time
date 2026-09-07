@@ -59,4 +59,9 @@ def test_train_saves_and_evaluate_loads_checkpoint(tmp_path):
         ]
     )
     results = evaluate(eval_args)
-    assert set(results.keys())
+    from dlquanttime.constants import METABOLITES
+
+    assert set(results.keys()) == set(METABOLITES.keys())
+    for metrics in results.values():
+        assert isinstance(metrics["pearson_r"], float)
+        assert isinstance(metrics["icc"], float)

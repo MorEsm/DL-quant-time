@@ -150,10 +150,17 @@ def train(args: Optional[argparse.Namespace] = None) -> "torch.nn.Module":
 
 
 def load_checkpoint(path: str) -> "torch.nn.Module":
-    """Load a model previously saved by :func:`train` via ``--checkpoint``."""
+    """Load a model previously saved by :func:`train` via ``--checkpoint``.
+
+    .. warning::
+        Checkpoints are deserialized with :func:`torch.load` using
+        ``weights_only=True`` to avoid executing arbitrary code from
+        untrusted pickle payloads. Nonetheless, checkpoints should only be
+        loaded from sources you trust.
+    """
     import torch
 
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model = _build_model(
         checkpoint["model_name"],
         checkpoint["n_metabolites"],
