@@ -1,4 +1,9 @@
+# Core dependencies (data simulation, AR feature extraction, metrics, losses).
 numpy>=1.21
 scipy>=1.7
+
+# Required only for the model/training code (dlquanttime.models, .train, .evaluate).
 torch>=1.10
+
+# Required to run the test suite.
 pytest>=7.0
