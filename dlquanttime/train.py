@@ -32,6 +32,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--ar-order", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional path to save the trained model's state and configuration to.",
+    )
     return parser
 
 
@@ -49,8 +55,13 @@ def _build_model(model_name: str, n_metabolites: int, n_ar_features: int, ggg_id
     raise ValueError(f"Unknown model: {model_name}")
 
 
-def train(args: Optional[argparse.Namespace] = None) -> None:
-    """Train a metabolite quantification model on synthetic data."""
+def train(args: Optional[argparse.Namespace] = None) -> "torch.nn.Module":
+    """Train a metabolite quantification model on synthetic data.
+
+    Returns the trained model. If ``args.checkpoint`` is set, the model's
+    state dict and the configuration needed to reconstruct it are also
+    saved to that path (see :func:`load_checkpoint`).
+    """
     args = args or build_argparser().parse_args()
 
     import torch
@@ -121,6 +132,36 @@ def train(args: Optional[argparse.Namespace] = None) -> None:
                     val_preds = val_preds[0]
             val_loss = criterion(y_val, val_preds).item()
         print(f"epoch {epoch + 1}/{args.epochs} train_loss={epoch_loss:.4f} val_loss={val_loss:.4f}")
+
+    if args.checkpoint:
+        torch.save(
+            {
+                "model_name": args.model,
+                "n_metabolites": len(metabolites),
+                "n_ar_features": 2 * args.ar_order,
+                "ggg_indices": idx,
+                "state_dict": model.state_dict(),
+            },
+            args.checkpoint,
+        )
+        print(f"Saved checkpoint to {args.checkpoint}")
+
+    return model
+
+
+def load_checkpoint(path: str) -> "torch.nn.Module":
+    """Load a model previously saved by :func:`train` via ``--checkpoint``."""
+    import torch
+
+    checkpoint = torch.load(path, map_location="cpu")
+    model = _build_model(
+        checkpoint["model_name"],
+        checkpoint["n_metabolites"],
+        checkpoint["n_ar_features"],
+        checkpoint["ggg_indices"],
+    )
+    model.load_state_dict(checkpoint["state_dict"])
+    return model
 
 
 if __name__ == "__main__":

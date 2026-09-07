@@ -43,14 +43,16 @@ and can be used/tested without it.)
 Train a model on synthetic data:
 
 ```bash
-python -m dlquanttime.train --model dc_densenet --n-train 30000 --n-val 1000 --epochs 20
-python -m dlquanttime.train --model mc_densenet_ggg --n-train 30000 --n-val 1000 --epochs 20
+python -m dlquanttime.train --model dc_densenet --n-train 30000 --n-val 1000 --epochs 20 --checkpoint dc_densenet.pt
+python -m dlquanttime.train --model mc_densenet_ggg --n-train 30000 --n-val 1000 --epochs 20 --checkpoint mc_densenet_ggg.pt
 ```
 
-Evaluate per-metabolite agreement (Pearson r, ICC(2,1)) on synthetic data:
+Evaluate per-metabolite agreement (Pearson r, ICC(2,1)) on synthetic data, using a
+trained checkpoint (falls back to a freshly-initialized model if `--checkpoint`
+is omitted, useful only as a pipeline smoke test):
 
 ```bash
-python -m dlquanttime.evaluate --model dc_densenet --n-test 1000
+python -m dlquanttime.evaluate --model dc_densenet --n-test 1000 --checkpoint dc_densenet.pt
 ```
 
 ## Tests

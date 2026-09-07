@@ -26,6 +26,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--n-test", type=int, default=1000)
     parser.add_argument("--ar-order", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a checkpoint saved by "
+            "'dlquanttime.train --checkpoint'. If omitted, a freshly "
+            "(randomly) initialized model is evaluated instead, which is "
+            "useful only as a smoke test of the evaluation pipeline."
+        ),
+    )
     return parser
 
 
@@ -43,12 +54,18 @@ def evaluate_predictions(
 
 
 def evaluate(args=None) -> Dict[str, Dict[str, float]]:
-    """Evaluate a (randomly-initialized, for smoke-testing) model on synthetic data."""
+    """Evaluate a model on synthetic data.
+
+    If ``args.checkpoint`` is set, the trained model saved there (via
+    ``dlquanttime.train --checkpoint``) is loaded and evaluated. Otherwise
+    a freshly (randomly) initialized model is evaluated instead, which
+    only serves as a smoke test of the evaluation pipeline.
+    """
     args = args or build_argparser().parse_args()
 
     import torch
 
-    from .train import _build_model
+    from .train import _build_model, load_checkpoint
 
     metabolites = tuple(METABOLITES.keys())
     idx = ggg_indices(metabolites)
@@ -57,7 +74,10 @@ def evaluate(args=None) -> Dict[str, Dict[str, float]]:
     fids, amps = generate_dataset(args.n_test, cfg)
     channels = fid_to_channels(fids)
 
-    model = _build_model(args.model, len(metabolites), 2 * args.ar_order, idx)
+    if args.checkpoint:
+        model = load_checkpoint(args.checkpoint)
+    else:
+        model = _build_model(args.model, len(metabolites), 2 * args.ar_order, idx)
     model.eval()
     x = torch.tensor(channels, dtype=torch.float32)
 
