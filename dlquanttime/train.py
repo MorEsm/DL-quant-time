@@ -105,7 +105,7 @@ def train(args: Optional[argparse.Namespace] = None) -> None:
                 preds = model(x_batch)
                 if isinstance(preds, tuple):
                     preds = preds[0]
-            loss = criterion(preds, y_batch)
+            loss = criterion(y_batch, preds)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * x_batch.shape[0]
@@ -119,7 +119,7 @@ def train(args: Optional[argparse.Namespace] = None) -> None:
                 val_preds = model(x_val)
                 if isinstance(val_preds, tuple):
                     val_preds = val_preds[0]
-            val_loss = criterion(val_preds, y_val).item()
+            val_loss = criterion(y_val, val_preds).item()
         print(f"epoch {epoch + 1}/{args.epochs} train_loss={epoch_loss:.4f} val_loss={val_loss:.4f}")
 
 

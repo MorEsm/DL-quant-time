@@ -71,7 +71,7 @@ def test_inverse_amplitude_weighted_loss_is_scalar_and_backprops():
     model = DCDenseNet(len(METABOLITES), n_points=cfg.n_points)
     criterion = InverseAmplitudeWeightedMSELoss()
     preds = model(x)
-    loss = criterion(preds, y)
+    loss = criterion(y, preds)
     assert loss.dim() == 0
     loss.backward()
     grad_norms = [p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None]

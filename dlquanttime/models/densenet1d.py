@@ -220,7 +220,7 @@ class MCDenseNetGGG(_DualInputDenseNetBase):
             block_layers=block_layers,
         )
         self.register_buffer(
-            "ggg_indices", torch.as_tensor(list(ggg_indices), dtype=torch.long)
+            "ggg_channel_indices", torch.as_tensor(list(ggg_indices), dtype=torch.long)
         )
 
         # AR pathway: constrained to only ever produce len(ggg_indices)
@@ -246,5 +246,5 @@ class MCDenseNetGGG(_DualInputDenseNetBase):
 
         ar_contribution = self.ar_pathway(ar_features)
         ggg_update = torch.zeros_like(out)
-        ggg_update.index_add_(1, self.ggg_indices, ar_contribution)
+        ggg_update.index_add_(1, self.ggg_channel_indices, ar_contribution)
         return out + ggg_update

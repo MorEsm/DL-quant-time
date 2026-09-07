@@ -90,7 +90,7 @@ if _HAS_TORCH:
             super().__init__()
             self.eps = eps
 
-        def forward(self, y_pred: "torch.Tensor", y_true: "torch.Tensor") -> "torch.Tensor":
+        def forward(self, y_true: "torch.Tensor", y_pred: "torch.Tensor") -> "torch.Tensor":
             mean_amp = y_true.mean(dim=0) + self.eps
             weights = 1.0 / mean_amp
             weights = weights * (weights.shape[0] / weights.sum())
